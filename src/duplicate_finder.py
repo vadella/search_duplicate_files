@@ -4,174 +4,92 @@
 # http://www.pythoncentral.io/finding-duplicate-files-with-python/
 # Original Author: Andres Torres
 
+# https://codereview.stackexchange.com/a/165374/123200
+
 # Adapted to check only compute the md5sum of files with the same size
-import datetime
-import os
-# import sys
+import collections
 import hashlib
-from collections import defaultdict
-
 from pathlib import Path
+from typing import Sequence
+
+import itertools
 
 
-def find_dup(parentFolder):
-    # Dups in format {hash:[names]}
-    dups = {}
-    for dirName, subdirs, fileList in os.walk(parentFolder):
-        print('Scanning %s...' % dirName)
-        for filename in fileList:
-            # Get the path to the file
-            path = os.path.join(dirName, filename)
-            # Calculate hash
-            file_hash = hashfile(path)
-            # Add or append the file path
-            if file_hash in dups:
-                dups[file_hash].append(path)
-            else:
-                dups[file_hash] = [path]
-    return dups
+class DuplicateFinder:
+    def __init__(self, path, glob_pattern='**/*'):
+        if isinstance(path, str):
+            path = Path(path)
+
+        all_files = (file for file in path.glob(glob_pattern) if file.is_file())
+        self.files_by_size = group_by_size(all_files)
+        self.files_by_hash = group_by_hash(self.files_by_size)
+        self.equal_files = list(group_by_equality(self.files_by_hash))
 
 
-
-def find_dup_size(parent_folder):
-    # Dups in format {hash:[names]}
-    duplicate_filesizes = defaultdict(list)
-    duplicate_filenames = defaultdict(list)
-    for dirName, subdirs, fileList in os.walk(parent_folder):
-        print('Scanning %s...' % dirName)
-        for filename in fileList:
-            # Get the path to the file
-            path = os.path.join(dirName, filename)
-            duplicate_filenames[filename].append(path)
-            # Calculate hash
-            file_size = os.path.getsize(path)
-            # Add or append the file path
-            duplicate_filesizes[file_size].append(path)
-    return filter_dict_size(duplicate_filesizes), filter_dict_size(duplicate_filenames)
+def group_by_size(files: Sequence[Path]):
+    # docstring can mostly remain the same
+    files_by_size = collections.defaultdict(list)
+    for file in files:
+        size = file.stat().st_size
+        files_by_size[size].append(file)
+    return files_by_size
 
 
-def find_dup_hash(file_list):
-    print('Comparing: ')
-    for filename in file_list:
-        print('    {}'.format(filename))
-    dups = {}
-    for path in file_list:
-        file_hash = hashfile(path)
-        if file_hash in dups:
-            dups[file_hash].append(path)
-        else:
-            dups[file_hash] = [path]
-    return dups
+def get_n_bytes(file: Path, n):
+    """
+    Return the first n bytes of filename in a bytes object. If n is -1 or
+    greater than size of the file, return all of the file's bytes.
+    """
+    with file.open("rb") as in_file:
+        return in_file.read(n)
 
 
-# Joins two dictionaries
-def join_dicts(dict1, dict2):
-    for key in dict2.keys():
-        if key in dict1:
-            dict1[key] = dict1[key] + dict2[key]
-        else:
-            dict1[key] = dict2[key]
+def file_iterator(file: Path, chunksize=512):
+    # inspired by https://stackoverflow.com/a/1035360/1562285
+    with file.open('rb') as f:
+        b = f.read(chunksize)
+        while b:
+            yield b
+            b = f.read(chunksize)
 
 
-def hashfile(path, blocksize=65536):
-    afile = open(path, 'rb')
-    hasher = hashlib.md5()
-    buf = afile.read(blocksize)
-    while len(buf) > 0:
-        hasher.update(buf)
-        buf = afile.read(blocksize)
-    afile.close()
-    return hasher.hexdigest()
+def group_by_hash(files_by_size, bytes_to_check=1000):
+    def get_hash(file_contents: bytes)->str:
+        return hashlib.sha256(file_contents).hexdigest()
+
+    files_by_hash = collections.defaultdict(list)
+    for key, files in files_by_size.items():
+        if isinstance(key, str) or isinstance(key, int):
+            key = key,
+        if len(files) > 1:
+            for file in files:
+                file_hash = get_hash(get_n_bytes(file, bytes_to_check))
+                # or alternatively
+                # filehash = base64.a85encode(get_n_bytes(filename, bytes_to_check))
+                files_by_hash[(*key, file_hash,)].append(file)
+    return files_by_hash
 
 
-def print_results(dict1):
-    results = list(filter(lambda x: len(x) > 1, dict1.values()))
-    if len(results) > 0:
-        print('Duplicates Found:')
-        print('The following files are identical. The name could differ, but the content is identical')
-        print('___________________')
-        for result in results:
-            for subresult in result:
-                print('\t\t%s' % subresult)
-            print('___________________')
-
-    else:
-        print('No duplicate files found.')
+def group_by_equality(files_by_hash):
+    for key, filenames in files_by_hash.items():
+        num_files = len(filenames)
+        if num_files > 1:
+            yield key, files_are_equal(filenames)
 
 
-def dump_results(dict1, filename):
-    # results = list(filter(lambda x: len(x) > 1, dict1.values()))
-    with open(filename, "w") as fh:
-        # fh.write("[\n")
-        for result in dict1.values():
-            for subresult in result:
-                fh.write(subresult + "\n")
-            fh.write("\n")
-            # fh.write(r"]")
+def files_are_equal(files: Sequence[Path]):
+    numfiles = len(files)
+    file_combinations = set(frozenset(i) for i in (itertools.combinations(range(numfiles), r=2)))
+    results = [{i for i in range(numfiles)} for j in range(numfiles)]
+    file_iterators = itertools.zip_longest(*(file_iterator(file) for file in files))
+    for file_contents in file_iterators:
+        for i, j in file_combinations:
+            if file_contents[i] != file_contents[j]:
+                file_combinations -= frozenset((i, j))
+                results[i] -= {j}
+                results[j] -= {i}
+                if not any(len(row) > 1 for row in results):
+                    return None
+    # print('r: ', results)
 
-
-def delete_doubles(dups, dummy=True):
-    print("starting deleting")
-    for result in dups.values():
-        for subresult in result:
-            if str(subresult).startswith(r"F:\fotos\fotos_ongesorteerd\nog te verdelen"):
-                print("deleting: %s" % str(subresult))
-                if not dummy:
-                    try:
-                        os.remove(subresult)
-                    except OSError:
-                        print("file %s does not exist anymore" % subresult)
-
-        pass
-
-def remove_double_from_filenames(dups_size, dup_name):
-    for key, dups in dups_size.items():
-        hit = False
-        for dup in dups:
-            if Path(dup).name in dup_name:
-                hit = True
-
-def filter_dict_size(dups):
-    return dict((k, v) for k, v in dups.items() if len(v) > 1)
-
-
-if __name__ == '__main__':
-    src_dir = r"F:\fotos\fotos_ongesorteerd"
-    # src_dir = r"F:\fotos\fotos_ongesorteerd\2015\2015 Jozefien"
-    dup_size, dup_filename = find_dup_size(src_dir)
-    dup_size = remove_double_from_filenames(dup_size, dup_filename)
-    # dups = {}
-    # for dup_list in dup_size.values():
-    #     if len(dup_list) > 1:
-    #         join_dicts(dups, find_dup_hash(dup_list))
-    # printResults(dups)
-    # print_results(dups)
-
-    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    dump_results(dup_size, "dup_size-%s.txt" % timestamp)
-    dump_results(dup_filename, "dup_name-%s.txt" % timestamp)
-
-    dummy = True
-    try:
-        delete_doubles(dup_filename, dummy)
-    except AttributeError:
-        pass
-    try:
-        delete_doubles(dup_size, dummy)
-    except AttributeError:
-        pass
-
-    # if len(sys.argv) > 1:
-    #     dups = {}
-    #     folders = sys.argv[1:]
-    #     for i in folders:
-    #         # Iterate the folders given
-    #         if os.path.exists(i):
-    #             # Find the duplicated files and append them to the dups
-    #             joinDicts(dups, findDup(i))
-    #         else:
-    #             print('%s is not a valid path, please verify' % i)
-    #             sys.exit()
-    #     printResults(dups)
-    # else:
-    #     print('Usage: python dupFinder.py folder or python dupFinder.py folder1 folder2 folder3')
+    return {tuple(files[i] for i in sorted(s)) for s in results if len(s) > 1}
